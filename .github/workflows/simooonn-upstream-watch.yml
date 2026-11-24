@@ -3,7 +3,7 @@ name: Simooonn Upstream Watch
 # Fork-only: daily, compare this fork's release branch against upstream main and,
 # while release is behind, post the unsynced upstream commits to Lark.
 # Stateless: the reminder repeats until release is synced.
-# Required repository secret: LARK_UPSTREAM_WEBHOOK.
+# Required repository secrets: LARK_WEBHOOK_URL, LARK_SECRET (signing).
 # This file lives only on the fork's main (default branch). "Sync fork > Update
 # branch" keeps it; "Discard commits" or --force deletes it.
 
@@ -12,47 +12,71 @@ on:
     - cron: '0 9 * * *'   # daily at 09:00 UTC
   workflow_dispatch:        # allow manual trigger
 
+permissions:
+  contents: read
+
 env:
   UPSTREAM: chenyme/grok2api
   FORK_BRANCH: release
+  MAX_LINES: 20
 
 jobs:
-  check-upstream:
+  notify:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
-      - name: Check upstream for new commits
-        id: compare
+      - name: Post unsynced upstream commits to Lark
+        shell: bash
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          LARK_WEBHOOK: ${{ secrets.LARK_UPSTREAM_WEBHOOK }}
-          FORK: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+          LARK_WEBHOOK_URL: ${{ secrets.LARK_WEBHOOK_URL }}
+          LARK_SECRET: ${{ secrets.LARK_SECRET }}
         run: |
+          missing=''
+          [ -n "$LARK_WEBHOOK_URL" ] || missing="$missing LARK_WEBHOOK_URL"
+          [ -n "$LARK_SECRET" ] || missing="$missing LARK_SECRET"
+          if [ -n "$missing" ]; then
+            echo "::error::Missing repository secret(s):$missing"
+            exit 1
+          fi
+
           # Compare Simooonn:release against chenyme:main
-          gh api "repos/$UPSTREAM/compare/${FORK%%/*}:$FORK_BRANCH...${UPSTREAM%%/*}:main" > compare.json
-
-          AHEAD=$(jq -r '.ahead_by' compare.json)
-          echo "ahead_by=$AHEAD" >> "$GITHUB_OUTPUT"
-
-          if [ "$AHEAD" = "0" ]; then
-            echo "No new upstream commits."
+          compare=$(gh api "repos/$UPSTREAM/compare/$GITHUB_REPOSITORY_OWNER:$FORK_BRANCH...${UPSTREAM%%/*}:main")
+          ahead=$(jq -er '.ahead_by | numbers' <<<"$compare")
+          if [ "$ahead" -eq 0 ]; then
+            echo "Fork $FORK_BRANCH is in sync with $UPSTREAM; nothing to notify."
             exit 0
           fi
 
-          # The compare API truncates its commits array at 250 entries, keeping the
-          # OLDEST ones, so .commits[-1] is not the current main tip. Ask the commits
-          # API for the newest ones instead, capped at AHEAD so we never list a commit
-          # release already has.
-          LIMIT=$(( AHEAD < 3 ? AHEAD : 3 ))
-          SUMMARY=$(gh api "repos/$UPSTREAM/commits?sha=main&per_page=$LIMIT" \
-            --jq '.[] | "• \(.commit.message | split("\n")[0]) (\(.sha[:7]))"')
-          URL="https://github.com/${UPSTREAM}/compare/${FORK%%/*}:${FORK_BRANCH}...${UPSTREAM%%/*}:main"
+          # Lark custom bot signing: HMAC-SHA256 keyed by "timestamp\nsecret" over an empty body.
+          timestamp=$(date +%s)
+          sign=$(printf '' | openssl dgst -sha256 -hmac "$timestamp"$'\n'"$LARK_SECRET" -binary | base64)
 
-          if [ -z "$LARK_WEBHOOK" ]; then
-            echo "LARK_UPSTREAM_WEBHOOK not set; skipping notification."
-            exit 0
+          # Compare lists commits oldest first; show the newest MAX_LINES, newest first, in UTC+8.
+          # Author is the GitHub login; fall back to the git author name when the email has no account.
+          payload=$(jq -c --arg ts "$timestamp" --arg sign "$sign" --arg upstream "$UPSTREAM" \
+            --arg branch "$FORK_BRANCH" --argjson max "$MAX_LINES" '
+            .ahead_by as $n
+            | [.commits[-$max:] | reverse[]
+                | (.commit.committer.date | fromdate + 28800 | strftime("%Y-%m-%d %H:%M")) as $time
+                | [{tag: "text", text: "\(.sha[0:7])  \($time)  \(.author.login // .commit.author.name): \(.commit.message | split("\n")[0])"}]
+              ] as $lines
+            | {
+                timestamp: $ts,
+                sign: $sign,
+                msg_type: "post",
+                content: {post: {zh_cn: {
+                  title: "上游 \($upstream) 有 \($n) 个提交未同步到 fork \($branch)",
+                  content: ($lines
+                    + (if $n > ($lines | length) then [[{tag: "text", text: "……另有 \($n - ($lines | length)) 个更早的提交未列出"}]] else [] end)
+                    + [[{tag: "a", text: "查看全部差异", href: .html_url}]])
+                }}}
+              }' <<<"$compare")
+
+          if ! response=$(curl -sS --fail-with-body --max-time 30 -H 'Content-Type: application/json' \
+            -d "$payload" "$LARK_WEBHOOK_URL") ||
+            [ "$(jq -r '.code // .StatusCode' <<<"$response" 2>/dev/null)" != 0 ]; then
+            echo "::error::Lark rejected the message: ${response:-no response}"
+            exit 1
           fi
-
-          # jq builds the payload so quotes in commit subjects cannot break the JSON
-          jq -n --arg ahead "$AHEAD" --arg summary "$SUMMARY" --arg url "$URL" \
-            '{msg_type: "text", content: {text: "⬆️ 上游 grok2api 有 \($ahead) 个新提交未合并到 release\n\n最近更新：\n\($summary)\n\n👉 \($url)"}}' \
-            | curl -sf -X POST "$LARK_WEBHOOK" -H "Content-Type: application/json" -d @-
+          echo "Posted $ahead unsynced commit(s) to Lark."
