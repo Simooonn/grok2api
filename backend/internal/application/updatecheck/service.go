@@ -17,9 +17,10 @@ import (
 )
 
 const (
-	latestReleaseAPI = "https://api.github.com/repos/chenyme/grok2api/releases/latest"
-	maxReleaseBytes  = 1 << 20
-	maxNotesRunes    = 4096
+	defaultReleaseRepo = "chenyme/grok2api"
+	latestReleaseAPI   = "https://api.github.com/repos/chenyme/grok2api/releases/latest"
+	maxReleaseBytes    = 1 << 20
+	maxNotesRunes      = 4096
 )
 
 type Status string
@@ -44,6 +45,7 @@ type Snapshot struct {
 
 type Service struct {
 	current string
+	repo    string
 	client  *http.Client
 	now     func() time.Time
 
@@ -62,6 +64,7 @@ func NewService(currentVersion string, client *http.Client) *Service {
 	}
 	return &Service{
 		current: currentVersion,
+		repo:    defaultReleaseRepo,
 		client:  client,
 		now:     time.Now,
 		snapshot: Snapshot{
@@ -69,6 +72,15 @@ func NewService(currentVersion string, client *http.Client) *Service {
 			Status:         StatusUnchecked,
 		},
 	}
+}
+
+// WithRepo overrides the GitHub "owner/repo" checked for releases.
+func (s *Service) WithRepo(ownerRepo string) *Service {
+	ownerRepo = strings.Trim(strings.TrimSpace(ownerRepo), "/")
+	if strings.Count(ownerRepo, "/") == 1 {
+		s.repo = ownerRepo
+	}
+	return s
 }
 
 func (s *Service) Snapshot() Snapshot {
@@ -120,7 +132,8 @@ type latestRelease struct {
 }
 
 func (s *Service) fetchLatest(ctx context.Context) (latestRelease, error) {
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, latestReleaseAPI, nil)
+	apiURL := "https://api.github.com/repos/" + s.repo + "/releases/latest"
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, apiURL, nil)
 	if err != nil {
 		return latestRelease{}, err
 	}
@@ -155,7 +168,7 @@ func (s *Service) fetchLatest(ctx context.Context) (latestRelease, error) {
 	}
 	return latestRelease{
 		Tag:   payload.Tag,
-		URL:   "https://github.com/chenyme/grok2api/releases/tag/" + url.PathEscape(payload.Tag),
+		URL:   "https://github.com/" + s.repo + "/releases/tag/" + url.PathEscape(payload.Tag),
 		Notes: truncateRunes(strings.TrimSpace(payload.Body), maxNotesRunes),
 	}, nil
 }
@@ -163,12 +176,17 @@ func (s *Service) fetchLatest(ctx context.Context) (latestRelease, error) {
 type semanticVersion struct {
 	major, minor, patch uint64
 	prerelease          string
+	forkRev             uint64
 }
 
 func parseSemanticVersion(value string) (semanticVersion, bool) {
 	value = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(value), "v"))
 	if before, _, ok := strings.Cut(value, "+"); ok {
 		value = before
+	}
+	var forkRev uint64
+	if base, rev, ok := splitForkRevision(value); ok {
+		value, forkRev = base, rev
 	}
 	prerelease := ""
 	if before, after, ok := strings.Cut(value, "-"); ok {
@@ -189,7 +207,24 @@ func parseSemanticVersion(value string) (semanticVersion, bool) {
 		}
 		numbers[index] = value
 	}
-	return semanticVersion{major: numbers[0], minor: numbers[1], patch: numbers[2], prerelease: prerelease}, true
+	return semanticVersion{major: numbers[0], minor: numbers[1], patch: numbers[2], prerelease: prerelease, forkRev: forkRev}, true
+}
+
+func splitForkRevision(value string) (string, uint64, bool) {
+	const marker = "-roamai."
+	idx := strings.LastIndex(value, marker)
+	if idx <= 0 {
+		return value, 0, false
+	}
+	part := value[idx+len(marker):]
+	if part == "" || part[0] == '0' {
+		return value, 0, false
+	}
+	number, err := strconv.ParseUint(part, 10, 64)
+	if err != nil || number == 0 {
+		return value, 0, false
+	}
+	return value[:idx], number, true
 }
 
 func compareSemanticVersion(left, right semanticVersion) int {
@@ -201,33 +236,35 @@ func compareSemanticVersion(left, right semanticVersion) int {
 			return 1
 		}
 	}
-	if left.prerelease == right.prerelease {
-		return 0
-	}
-	leftHotfix, leftHotfixNumber := projectHotfix(left.prerelease)
-	rightHotfix, rightHotfixNumber := projectHotfix(right.prerelease)
-	if leftHotfix && rightHotfix {
-		if leftHotfixNumber < rightHotfixNumber {
-			return -1
-		}
-		if leftHotfixNumber > rightHotfixNumber {
+	if left.prerelease != right.prerelease {
+		leftHotfix, leftHotfixNumber := projectHotfix(left.prerelease)
+		rightHotfix, rightHotfixNumber := projectHotfix(right.prerelease)
+		if leftHotfix && rightHotfix {
+			if leftHotfixNumber < rightHotfixNumber {
+				return -1
+			}
+			if leftHotfixNumber > rightHotfixNumber {
+				return 1
+			}
+		} else if leftHotfix {
 			return 1
+		} else if rightHotfix {
+			return -1
+		} else if left.prerelease == "" {
+			return 1
+		} else if right.prerelease == "" {
+			return -1
+		} else if cmp := strings.Compare(left.prerelease, right.prerelease); cmp != 0 {
+			return cmp
 		}
-		return 0
 	}
-	if leftHotfix {
-		return 1
-	}
-	if rightHotfix {
+	if left.forkRev < right.forkRev {
 		return -1
 	}
-	if left.prerelease == "" {
+	if left.forkRev > right.forkRev {
 		return 1
 	}
-	if right.prerelease == "" {
-		return -1
-	}
-	return strings.Compare(left.prerelease, right.prerelease)
+	return 0
 }
 
 func projectHotfix(value string) (bool, uint64) {

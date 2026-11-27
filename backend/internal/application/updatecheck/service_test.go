@@ -88,3 +88,32 @@ func TestCheckFindsHotfixAfterStableRelease(t *testing.T) {
 		t.Fatalf("snapshot = %#v", snapshot)
 	}
 }
+
+func TestForkRevisionOrderingAndRepoOverride(t *testing.T) {
+	base, ok := parseSemanticVersion("v3.1.8")
+	if !ok {
+		t.Fatal("base version rejected")
+	}
+	rev1, ok := parseSemanticVersion("v3.1.8-roamai.1")
+	if !ok {
+		t.Fatal("fork rev 1 rejected")
+	}
+	rev2, _ := parseSemanticVersion("v3.1.8-roamai.2")
+	rev10, _ := parseSemanticVersion("v3.1.8-roamai.10")
+	next, _ := parseSemanticVersion("v3.1.9")
+	if compareSemanticVersion(rev1, base) <= 0 || compareSemanticVersion(rev2, rev1) <= 0 || compareSemanticVersion(rev10, rev2) <= 0 || compareSemanticVersion(next, rev10) <= 0 {
+		t.Fatal("fork revision ordering is invalid")
+	}
+
+	client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		if request.URL.String() != "https://api.github.com/repos/Simooonn/grok2api/releases/latest" {
+			t.Fatalf("unexpected url: %s", request.URL.String())
+		}
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"tag_name":"v3.1.8-roamai.2","body":"Fork notes"}`)), Header: make(http.Header)}, nil
+	})}
+	service := NewService("v3.1.8-roamai.1", client).WithRepo("Simooonn/grok2api")
+	snapshot := service.Check(context.Background())
+	if snapshot.Status != StatusUpdateAvailable || !snapshot.UpdateAvailable || snapshot.ReleaseURL != "https://github.com/Simooonn/grok2api/releases/tag/v3.1.8-roamai.2" {
+		t.Fatalf("snapshot = %#v", snapshot)
+	}
+}

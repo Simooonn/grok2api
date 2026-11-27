@@ -1,0 +1,9 @@
+[Unit]
+Description=Watch for grok2api web upgrade requests
+
+[Path]
+PathExists=@CONTROL_DIR@/inbox/request.json
+Unit=grok2api-upgrade-agent.service
+
+[Install]
+WantedBy=multi-user.target

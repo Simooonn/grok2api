@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"net/http"
+	"os"
 	"time"
 
 	_ "github.com/chenyme/grok2api/backend/docs"
@@ -19,6 +20,8 @@ import (
 	modelapp "github.com/chenyme/grok2api/backend/internal/application/model"
 	settingsapp "github.com/chenyme/grok2api/backend/internal/application/settings"
 	updatecheckapp "github.com/chenyme/grok2api/backend/internal/application/updatecheck"
+	upgradeapp "github.com/chenyme/grok2api/backend/internal/application/upgrade"
+	"github.com/chenyme/grok2api/backend/internal/buildinfo"
 	accounthttp "github.com/chenyme/grok2api/backend/internal/transport/http/account"
 	adminauthhttp "github.com/chenyme/grok2api/backend/internal/transport/http/adminauth"
 	audithttp "github.com/chenyme/grok2api/backend/internal/transport/http/audit"
@@ -164,7 +167,11 @@ func New(deps Dependencies) *gin.Engine {
 			return deps.Settings.PublicAPIBaseURL()
 		}
 		return deps.PublicAPIBaseURL
-	}, deps.Updates).Register(adminProtected)
+	}, deps.Updates).WithUpgrades(upgradeapp.NewService(upgradeapp.Config{
+		ControlDir:     os.Getenv("GROK2API_UPGRADE_CONTROL_DIR"),
+		ReleaseRepo:    os.Getenv("GROK2API_RELEASE_REPO"),
+		CurrentVersion: buildinfo.CurrentVersion(),
+	}, nil)).Register(adminProtected)
 
 	if deps.QualityGuardToken != "" {
 		qualityGuardInternal := router.Group("/api/internal/v1/quality-guard")

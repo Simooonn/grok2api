@@ -1,5 +1,5 @@
 import { apiRequest } from "@/shared/api/client";
-import { createObjectDecoder, isBoolean, isOneOf, isString, type ValueValidator } from "@/shared/api/decoder";
+import { createObjectDecoder, hasShape, isArrayOf, isBoolean, isOneOf, isString, type ValueValidator } from "@/shared/api/decoder";
 
 export type SystemInfoDTO = {
   publicApiBaseURL: string;
@@ -42,4 +42,92 @@ export function getVersionInfo(): Promise<VersionInfoDTO> {
 
 export function checkForUpdates(): Promise<VersionInfoDTO> {
   return apiRequest("/api/admin/v1/system/update/check", { method: "POST" }, decodeVersionInfo);
+}
+
+export type ForkReleaseDTO = {
+  tag: string;
+  name: string;
+  url: string;
+  notes: string;
+  publishedAt: string;
+};
+
+const isForkRelease = hasShape({
+  tag: isString,
+  name: isString,
+  url: isString,
+  notes: isString,
+  publishedAt: isString,
+});
+
+const decodeForkReleases = createObjectDecoder<{ releases: ForkReleaseDTO[] }>("fork releases", {
+  releases: isArrayOf(isForkRelease),
+});
+
+export async function getForkReleases(force = false): Promise<ForkReleaseDTO[]> {
+  const query = force ? "?force=1" : "";
+  const data = await apiRequest(`/api/admin/v1/system/releases${query}`, {}, decodeForkReleases);
+  return data.releases;
+}
+
+export type UpgradeOperationDTO = {
+  id: string;
+  tag: string;
+  phase: string;
+  message: string;
+  fromVersion: string;
+  requestedBy: string;
+  updatedAt: string;
+};
+
+const isUpgradeOperation = hasShape({
+  id: isString,
+  tag: isString,
+  phase: isString,
+  message: isString,
+  fromVersion: isString,
+  requestedBy: isString,
+  updatedAt: isString,
+});
+
+const isNullableOperation: ValueValidator = (value) => value === null || isUpgradeOperation(value);
+
+export type UpgradeStatusDTO = {
+  enabled: boolean;
+  agentOnline: boolean;
+  agentUpdatedAt: string;
+  imageRepo: string;
+  currentTag: string;
+  currentVersion: string;
+  inProgress: boolean;
+  operation: UpgradeOperationDTO | null;
+};
+
+const decodeUpgradeStatus = createObjectDecoder<UpgradeStatusDTO>("upgrade status", {
+  enabled: isBoolean,
+  agentOnline: isBoolean,
+  agentUpdatedAt: isString,
+  imageRepo: isString,
+  currentTag: isString,
+  currentVersion: isString,
+  inProgress: isBoolean,
+  operation: isNullableOperation,
+});
+
+const decodeUpgradeOperation = createObjectDecoder<UpgradeOperationDTO>("upgrade operation", {
+  id: isString,
+  tag: isString,
+  phase: isString,
+  message: isString,
+  fromVersion: isString,
+  requestedBy: isString,
+  updatedAt: isString,
+});
+
+export function getUpgradeStatus(): Promise<UpgradeStatusDTO> {
+  return apiRequest("/api/admin/v1/system/upgrade/status", {}, decodeUpgradeStatus);
+}
+
+export function requestUpgrade(tag: string): Promise<UpgradeOperationDTO> {
+  return apiRequest("/api/admin/v1/system/upgrade", { method: "POST", body: { tag } }, decodeUpgradeOperation);
 }

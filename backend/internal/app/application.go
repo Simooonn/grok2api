@@ -27,6 +27,7 @@ import (
 	quotarecoveryapp "github.com/chenyme/grok2api/backend/internal/application/quotarecovery"
 	settingsapp "github.com/chenyme/grok2api/backend/internal/application/settings"
 	updatecheckapp "github.com/chenyme/grok2api/backend/internal/application/updatecheck"
+	upgradeapp "github.com/chenyme/grok2api/backend/internal/application/upgrade"
 	"github.com/chenyme/grok2api/backend/internal/buildinfo"
 	"github.com/chenyme/grok2api/backend/internal/domain/account"
 	"github.com/chenyme/grok2api/backend/internal/infra/config"
@@ -422,7 +423,11 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*Applicat
 		clientKeyService.UpdateDefaults(next.ClientKeyDefaults.RPMLimit, next.ClientKeyDefaults.MaxConcurrent)
 		accountService.UpdateAutoCleanConfig(accountAutoCleanConfig(next.Accounts))
 	})
-	updateService := updatecheckapp.NewService(buildinfo.CurrentVersion(), nil)
+	releaseRepo := strings.TrimSpace(os.Getenv("GROK2API_RELEASE_REPO"))
+	if releaseRepo == "" {
+		releaseRepo = upgradeapp.DefaultReleaseRepo
+	}
+	updateService := updatecheckapp.NewService(buildinfo.CurrentVersion(), nil).WithRepo(releaseRepo)
 
 	startup := newStartupState(len(windows))
 	readiness := func(readyCtx context.Context) httpserver.ReadinessSnapshot {

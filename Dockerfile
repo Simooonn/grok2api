@@ -27,6 +27,7 @@ FROM --platform=$BUILDPLATFORM golang:${GO_VERSION}-alpine AS backend-builder
 
 ARG TARGETOS
 ARG TARGETARCH
+ARG APP_VERSION=""
 
 WORKDIR /src/backend
 RUN apk add --no-cache ca-certificates git
@@ -40,8 +41,12 @@ COPY backend/internal ./internal
 COPY backend/docs/docs.go ./docs/docs.go
 RUN --mount=type=cache,id=grok2api-go-mod,target=/go/pkg/mod,sharing=locked \
     --mount=type=cache,id=grok2api-go-build,target=/root/.cache/go-build,sharing=locked \
+    LDFLAGS="-s -w"; \
+    if [ -n "${APP_VERSION}" ]; then \
+      LDFLAGS="${LDFLAGS} -X github.com/chenyme/grok2api/backend/internal/buildinfo.Version=${APP_VERSION}"; \
+    fi; \
     CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH \
-    go build -buildvcs=false -trimpath -ldflags="-s -w" -o /out/grok2api ./cmd/grok2api
+    go build -buildvcs=false -trimpath -ldflags="${LDFLAGS}" -o /out/grok2api ./cmd/grok2api
 
 
 FROM alpine:${ALPINE_VERSION}

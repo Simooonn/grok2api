@@ -26,6 +26,16 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Guard fork release tag
+        if: github.repository == 'Simooonn/grok2api' && startsWith(github.ref, 'refs/tags/')
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?-roamai\.[1-9][0-9]*$ ]]; then
+            echo "::error::Fork release tag must look like vX.Y.Z-roamai.N, got '$TAG'"
+            exit 1
+          fi
+
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
@@ -160,6 +170,8 @@ jobs:
           file: ./Dockerfile
           platforms: ${{ matrix.platform }}
           push: true
+          build-args: |
+            APP_VERSION=${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || '' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha,scope=${{ matrix.arch }}
@@ -217,3 +229,43 @@ jobs:
 
       - name: Inspect image
         run: docker buildx imagetools inspect "${{ steps.image.outputs.name }}:${{ steps.meta.outputs.version }}"
+
+  create_release:
+    name: Publish GitHub Release
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && github.repository == 'Simooonn/grok2api'
+    needs:
+      - merge
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          image_repo="ghcr.io/$(printf '%s' "$REPO" | tr '[:upper:]' '[:lower:]')"
+          tag_notes=$(git tag -l --format='%(contents:body)' "$TAG")
+          notes_file=$(mktemp)
+          {
+            if [ -n "$tag_notes" ]; then
+              printf '%s\n\n' "$tag_notes"
+            fi
+            printf '### Docker Image\n\n```\ndocker pull %s:%s\n```\n' "$image_repo" "$TAG"
+          } > "$notes_file"
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" --latest --notes-file "$notes_file"
+          else
+            gh release create "$TAG" \
+              --latest \
+              --title "$TAG" \
+              --notes-file "$notes_file" \
+              --generate-notes
+          fi
