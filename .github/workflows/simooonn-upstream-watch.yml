@@ -1,82 +1,129 @@
 name: Simooonn Upstream Watch
 
-# Fork-only: daily, compare this fork's release branch against upstream main and,
-# while release is behind, post the unsynced upstream commits to Lark.
-# Stateless: the reminder repeats until release is synced.
+# Notify a Lark group when chenyme/grok2api main has commits this fork's release
+# branch does not have yet. Scheduled runs use the default branch (main); compare
+# the production release branch and deduplicate notifications by upstream head SHA.
 # Required repository secrets: LARK_WEBHOOK_URL, LARK_SECRET (signing).
 # This file lives only on the fork's main (default branch). "Sync fork > Update
 # branch" keeps it; "Discard commits" or --force deletes it.
 
 on:
   schedule:
-    - cron: '0 9 * * *'   # daily at 09:00 UTC
-  workflow_dispatch:        # allow manual trigger
+    - cron: '23 */3 * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'Send even if this upstream commit was already notified'
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
-env:
-  UPSTREAM: chenyme/grok2api
-  FORK_BRANCH: release
-  MAX_LINES: 20
+concurrency:
+  group: upstream-watch
+  cancel-in-progress: false
 
 jobs:
-  notify:
+  watch:
+    if: github.repository == 'Simooonn/grok2api'
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
+    env:
+      UPSTREAM: chenyme/grok2api
+      FORK: ${{ github.repository }}
+      FORK_BRANCH: release
     steps:
-      - name: Post unsynced upstream commits to Lark
-        shell: bash
+      - name: Compare fork release branch with upstream main
+        id: cmp
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api "repos/$UPSTREAM/compare/${FORK%%/*}:$FORK_BRANCH...${UPSTREAM%%/*}:main" > compare.json
+          gh api "repos/$UPSTREAM/releases/latest" --jq .tag_name > upstream-release.txt || echo unknown > upstream-release.txt
+          gh api "repos/$FORK/releases/latest" --jq .tag_name > fork-release.txt || echo none > fork-release.txt
+          ahead=$(jq -r .ahead_by compare.json)
+          head_sha=$(gh api "repos/$UPSTREAM/commits/main" --jq .sha)
+          echo "ahead=$ahead" >> "$GITHUB_OUTPUT"
+          echo "head=$head_sha" >> "$GITHUB_OUTPUT"
+          echo "Upstream main is $ahead commit(s) ahead of $FORK:$FORK_BRANCH (head: ${head_sha:0:7})"
+
+      - name: Check whether this upstream head was already notified
+        id: seen
+        if: steps.cmp.outputs.ahead != '0'
+        uses: actions/cache/restore@v4
+        with:
+          path: .upstream-watch
+          key: upstream-watch-${{ steps.cmp.outputs.head }}
+          lookup-only: true
+
+      - name: Notify Lark
+        if: steps.cmp.outputs.ahead != '0' && (steps.seen.outputs.cache-hit != 'true' || inputs.force)
         env:
           GH_TOKEN: ${{ github.token }}
           LARK_WEBHOOK_URL: ${{ secrets.LARK_WEBHOOK_URL }}
           LARK_SECRET: ${{ secrets.LARK_SECRET }}
         run: |
-          missing=''
-          [ -n "$LARK_WEBHOOK_URL" ] || missing="$missing LARK_WEBHOOK_URL"
-          [ -n "$LARK_SECRET" ] || missing="$missing LARK_SECRET"
-          if [ -n "$missing" ]; then
-            echo "::error::Missing repository secret(s):$missing"
-            exit 1
-          fi
+          python3 - <<'PY'
+          import base64, datetime, hashlib, hmac, json, os, subprocess, sys, time, urllib.request
 
-          # Compare Simooonn:release against chenyme:main
-          compare=$(gh api "repos/$UPSTREAM/compare/$GITHUB_REPOSITORY_OWNER:$FORK_BRANCH...${UPSTREAM%%/*}:main")
-          ahead=$(jq -er '.ahead_by | numbers' <<<"$compare")
-          if [ "$ahead" -eq 0 ]; then
-            echo "Fork $FORK_BRANCH is in sync with $UPSTREAM; nothing to notify."
-            exit 0
-          fi
+          webhook = os.environ.get("LARK_WEBHOOK_URL", "")
+          if not webhook:
+              sys.exit("LARK_WEBHOOK_URL secret is not set")
+          upstream, fork, branch = os.environ["UPSTREAM"], os.environ["FORK"], os.environ["FORK_BRANCH"]
+          cmp = json.load(open("compare.json"))
+          ahead = int(cmp["ahead_by"])
+          limit = min(ahead, 10)
+          newest = json.loads(subprocess.check_output(
+              ["gh", "api", f"repos/{upstream}/commits?sha=main&per_page={limit}"],
+              text=True,
+          ))
 
-          # Lark custom bot signing: HMAC-SHA256 keyed by "timestamp\nsecret" over an empty body.
-          timestamp=$(date +%s)
-          sign=$(printf '' | openssl dgst -sha256 -hmac "$timestamp"$'\n'"$LARK_SECRET" -binary | base64)
+          lines = [
+              f"上游 {upstream} 的 main 比 {fork} 的 {branch} 超前 {ahead} 个提交",
+              f"上游最新 Release：{open('upstream-release.txt').read().strip()}；你的最新 Release：{open('fork-release.txt').read().strip()}",
+              "最近的上游提交：",
+          ]
+          tz8 = datetime.timezone(datetime.timedelta(hours=8))
+          for c in newest:
+              raw_date = c["commit"]["committer"]["date"].replace("Z", "+00:00")
+              dt = datetime.datetime.fromisoformat(raw_date).astimezone(tz8).strftime("%m-%d %H:%M")
+              author = (c.get("author") or {}).get("login") or c["commit"]["author"]["name"]
+              title = c["commit"]["message"].splitlines()[0][:100]
+              lines.append(f"• {c['sha'][:7]}  {dt}  {author}: {title}")
+          if ahead > len(newest):
+              lines.append(f"…另有 {ahead - len(newest)} 个更早的提交")
+          compare_url = f"https://github.com/{fork}/compare/{branch}...{upstream.replace('/', ':')}:main"
 
-          # Compare lists commits oldest first; show the newest MAX_LINES, newest first, in UTC+8.
-          # Author is the GitHub login; fall back to the git author name when the email has no account.
-          payload=$(jq -c --arg ts "$timestamp" --arg sign "$sign" --arg upstream "$UPSTREAM" \
-            --arg branch "$FORK_BRANCH" --argjson max "$MAX_LINES" '
-            .ahead_by as $n
-            | [.commits[-$max:] | reverse[]
-                | (.commit.committer.date | fromdate + 28800 | strftime("%Y-%m-%d %H:%M")) as $time
-                | [{tag: "text", text: "\(.sha[0:7])  \($time)  \(.author.login // .commit.author.name): \(.commit.message | split("\n")[0])"}]
-              ] as $lines
-            | {
-                timestamp: $ts,
-                sign: $sign,
-                msg_type: "post",
-                content: {post: {zh_cn: {
-                  title: "上游 \($upstream) 有 \($n) 个提交未同步到 fork \($branch)",
-                  content: ($lines
-                    + (if $n > ($lines | length) then [[{tag: "text", text: "……另有 \($n - ($lines | length)) 个更早的提交未列出"}]] else [] end)
-                    + [[{tag: "a", text: "查看全部差异", href: .html_url}]])
-                }}}
-              }' <<<"$compare")
+          content = [[{"tag": "text", "text": line}] for line in lines]
+          content.append([{"tag": "a", "text": "在 GitHub 查看差异", "href": compare_url}])
+          payload = {
+              "msg_type": "post",
+              "content": {"post": {"zh_cn": {"title": "[grok2api] 上游有新提交", "content": content}}},
+          }
 
-          if ! response=$(curl -sS --fail-with-body --max-time 30 -H 'Content-Type: application/json' \
-            -d "$payload" "$LARK_WEBHOOK_URL") ||
-            [ "$(jq -r '.code // .StatusCode' <<<"$response" 2>/dev/null)" != 0 ]; then
-            echo "::error::Lark rejected the message: ${response:-no response}"
-            exit 1
-          fi
-          echo "Posted $ahead unsynced commit(s) to Lark."
+          secret = os.environ.get("LARK_SECRET", "")
+          if secret:
+              ts = str(int(time.time()))
+              sign = hmac.new(f"{ts}\n{secret}".encode(), b"", hashlib.sha256).digest()
+              payload.update(timestamp=ts, sign=base64.b64encode(sign).decode())
+
+          req = urllib.request.Request(webhook, data=json.dumps(payload).encode(), headers={"Content-Type": "application/json"})
+          resp = json.load(urllib.request.urlopen(req, timeout=15))
+          if resp.get("code", resp.get("StatusCode", 0)) != 0:
+              sys.exit(f"Lark rejected the message: {resp}")
+          print("Lark notified")
+          PY
+
+      - name: Remember notified upstream head
+        if: steps.cmp.outputs.ahead != '0' && steps.seen.outputs.cache-hit != 'true'
+        env:
+          HEAD_SHA: ${{ steps.cmp.outputs.head }}
+        run: mkdir -p .upstream-watch && echo "$HEAD_SHA" > .upstream-watch/head
+
+      - name: Save notified marker
+        if: steps.cmp.outputs.ahead != '0' && steps.seen.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: .upstream-watch
+          key: upstream-watch-${{ steps.cmp.outputs.head }}
